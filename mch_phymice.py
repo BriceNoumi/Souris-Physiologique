@@ -172,7 +172,7 @@ class PhyMice:
         self.idle_sensitivities = { name: cfg["idle_sensitivity"] for name, cfg in channels_config.items() }
         self.active_sensitivities = { name: cfg.get("active_sensitivity", 0) for name, cfg in channels_config.items() }
 
-        self.plotmgr = DynamicPlotManager("Accelerometer signals", self.channels.values(), window_size, y_window=(-100, 100))
+        self.plotmgr = DynamicPlotManager("Real-time signals", self.channels.values(), window_size, y_window=(-100, 100))
         self.plotmgr["unstable_msg"] = (
             self.plotmgr.fig.text(1, 1, "UNSTABLE", fontsize=10, color='red',
                 horizontalalignment='right', transform=self.plotmgr.ax.transAxes))
@@ -206,7 +206,10 @@ class PhyMice:
     def _unstable(self) -> bool:
         unstable = False
         for name, ch in self.channels.items():
-            if self.idle_sensitivities[name] != 0 and ch.all_outside_range(self.idle_sensitivities[name]):
+            if (name != "Force"
+                and self.idle_sensitivities[name] != 0
+                and ch.all_outside_range(self.idle_sensitivities[name])
+               ):
                 unstable = True
                 break
         return unstable
@@ -217,9 +220,8 @@ class PhyMice:
         emg = self.channels["EMG"]
         force = self.channels["Force"]
 
-        if force[0] < 20:
-            # not active
-            return False
+        active = (force[-1] > 20) # threshold doesn't really matter
+        inhibited = '' if active else '(inhibited)'
 
         # Attempt to detect movement on X and Y axis
         for ch in [acc_x, acc_y]:
@@ -231,7 +233,14 @@ class PhyMice:
             idle_thr = self.idle_sensitivities[ch.name]
             act_thr = self.active_sensitivities[ch.name]
             cur_state = self.channels_state[ch.name]
-            DIRECTIONS = ["left", "right"] if ch.name == "Acc X" else ["down", "up"]
+            # depends on ACC orientation
+            DIRECTIONS = {
+                True: "left",
+                False: "right",
+            } if ch.name == "Acc X" else {
+                True: "up",
+                False: "down",
+            }
 
             def _idle(i):
                 return -idle_thr <= ch[i] <= idle_thr
@@ -240,11 +249,10 @@ class PhyMice:
                 return not -act_thr <= ch[i] <= act_thr
 
             if cur_state == 0: # idle
-                # transition to active if the last sample is active
-                # and a few samples before that are idle (edge detection)
-                if _active(-1) and sum(_idle(-i) for i in range(2, 8+1)) > 5:
-                    delta = ch[-1] - ch[-2]
-                    print(f"Move {DIRECTIONS[0 if delta > 0 else 1]}")
+                # transition to active if the last few samples are active
+                if _active(-1) and _active(-2) and _active(-3):
+                    positive_move = (ch[-3] - ch[-2]) < 0
+                    print(f"Move {DIRECTIONS[positive_move]} {inhibited}")
                     self.channels_state[ch.name] = 1
 
             elif cur_state == 1: # moving
@@ -257,16 +265,17 @@ class PhyMice:
         # Attempt to detect muscle activity in EMG
         # (active if the delta between max and min is
         #  above threshold for the past 5 samples)
-        emg_wnd = [emg[i] for i in range(-5, 0)]
-        emg_delta = max(emg_wnd) - min(emg_wnd)
-        if self.channels_state[emg.name] == 0:
-            if emg_delta > self.active_sensitivities[emg.name]:
-                print("Muscle activity detected!")
-                self.channels_state[emg.name] = 1
-        elif emg_delta <= self.idle_sensitivities[emg.name]:
-                self.channels_state[emg.name] = 0
+        if len(emg) >= 5:
+            emg_wnd = [emg[i] for i in range(-5, 0)]
+            emg_delta = max(emg_wnd) - min(emg_wnd)
+            if self.channels_state[emg.name] == 0:
+                if emg_delta > self.active_sensitivities[emg.name]:
+                    print(f"Muscle activity detected! {inhibited}")
+                    self.channels_state[emg.name] = 1
+            elif emg_delta <= self.idle_sensitivities[emg.name]:
+                    self.channels_state[emg.name] = 0
 
-        return True
+        return active
 
     def go(self):
         RETRY_INTERVAL = 3
@@ -304,13 +313,13 @@ def main():
     cfg = {
         "Acc X": {
             "color": "r",
-            "idle_sensitivity": 1,
+            "idle_sensitivity": 3,
             "active_sensitivity": 10,
             "filter": uFT.ButterworthLPF(cutoff=3, fs=20, order=2)
         },
         "Acc Y": {
             "color": "b",
-            "idle_sensitivity": 1,
+            "idle_sensitivity": 3,
             "active_sensitivity": 10,
             "filter": uFT.ButterworthLPF(cutoff=3, fs=20, order=2)
         },
